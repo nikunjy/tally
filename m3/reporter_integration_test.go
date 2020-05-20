@@ -24,45 +24,12 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/exec"
-	"path"
 	"sync"
 	"testing"
-
-	"github.com/stretchr/testify/require"
-)
-
-var (
-	mainFileFmt = `
-package main
-
-import (
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"github.com/uber-go/tally"
-	"github.com/uber-go/tally/m3"
-)
-
-func main() {
-	r, err := m3.NewReporter(m3.Options{
-		HostPorts: []string{"%s"},
-		Service:   "test-service",
-		Env:       "test",
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	scope, closer := tally.NewRootScope(tally.ScopeOptions{
-		CachedReporter: r,
-	}, 5 * time.Second)
-	defer closer.Close()
-
-	scope.Counter("my-counter").Inc(42)
-	scope.Gauge("my-gauge").Update(123)
-	scope.Timer("my-timer").Record(456 * time.Millisecond)
-}
-	`
 )
 
 // TestIntegrationProcessFlushOnExit tests whether data is correctly flushed
@@ -80,31 +47,27 @@ func testProcessFlushOnExit(t *testing.T, i int) {
 
 	var wg sync.WaitGroup
 	server := newFakeM3Server(t, &wg, true, Compact)
+	wg.Add(1)
 	go server.Serve()
 	defer server.Close()
 
-	mainFile := path.Join(dir, "main.go")
-	mainFileContents := fmt.Sprintf(mainFileFmt, server.Addr)
+	r, err := NewReporter(Options{
+		HostPorts: []string{server.Addr},
+		Service:   "test-service",
+		Env:       "test",
+	})
+	require.NoError(t, err)
 
-	fileErr := ioutil.WriteFile(mainFile, []byte(mainFileContents), 0666)
-	require.NoError(t, fileErr)
+	scope, closer := tally.NewRootScope(tally.ScopeOptions{
+		CachedReporter: r,
+	}, 5*time.Second)
 
-	binary := path.Join(dir, "m3testemit")
+	scope.Counter("my-counter").Inc(42)
+	scope.Gauge("my-gauge").Update(123)
+	scope.Timer("my-timer").Record(456 * time.Millisecond)
 
-	// build
-	cmd := exec.Command("go", "build", "-o", binary, mainFile)
-	cmd.Dir = dir
-	output, err := cmd.CombinedOutput()
-	require.NoError(t, err, fmt.Sprintf("output:\n\n%s", output))
-
-	// run, do not sleep at end of the main program as per
-	// main program source code
-	wg.Add(1)
-	require.NoError(t, exec.Command(binary).Run())
-
-	// Wait for fake M3 server to receive the batch
+	closer.Close()
 	wg.Wait()
-
 	require.Equal(t, 1, len(server.Service.getBatches()))
 	require.NotNil(t, server.Service.getBatches()[0])
 	require.Equal(t, 3, len(server.Service.getBatches()[0].GetMetrics()))
